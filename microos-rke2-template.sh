@@ -370,7 +370,7 @@ finalize_for_template() {
   ln -sf /etc/machine-id /var/lib/dbus/machine-id
 
   sync
-  shutdown -h now
+  echo "( ./merge-snapshoots.sh --apply ) shutdown -h now "
 }
 
 usage() {
