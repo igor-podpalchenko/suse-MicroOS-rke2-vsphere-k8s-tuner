@@ -1,23 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# prune_snapper_keep_default.sh
+# merge-snapshoots.sh
 #
 # Goal:
-#   Remove all old Snapper snapshots so that, after reboot, GRUB shows
-#   only ONE "Snapshot Update of #N" entry (the default snapshot).
+#   Discard all snapshots except the CURRENT running system state,
+#   so after reboot GRUB shows only a single "Snapshot Update ..." entry.
 #
-# Safety:
-#   - Always keeps #1 (first root filesystem)
-#   - Keeps the *default* snapshot (the one that will boot next)
-#   - Keeps the *current* snapshot (if booted from /.snapshots/N/snapshot), to avoid self-amputation
+# What it does (in --apply):
+#   1) Detect CURRENT root subvolume and set it as Btrfs default (next boot = same state)
+#   2) Delete all Snapper snapshots except CURRENT (if current is a snapshot) or delete all snapshots (if not)
+#   3) Delete orphaned /.snapshots/<N>/snapshot subvolumes not known to snapper (if any)
+#   4) Regenerate /boot/grub2/grub.cfg (best-effort; tries to remount /boot rw)
 #
 # Usage:
-#   sudo ./prune_snapper_keep_default.sh          # dry-run
-#   sudo ./prune_snapper_keep_default.sh --apply  # delete
+#   sudo ./merge-snapshoots.sh           # dry-run
+#   sudo ./merge-snapshoots.sh --apply   # apply deletions
 #
-# Optional:
-#   --config root   (snapper config name; default: root)
+# Notes:
+# - This is intentionally aggressive: it removes rollback history.
 
 APPLY=0
 CFG="root"
@@ -47,24 +48,15 @@ fi
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-if ! have snapper; then
-  echo "snapper not found." >&2
-  exit 1
-fi
-if ! have btrfs; then
-  echo "btrfs not found." >&2
-  exit 1
-fi
-if ! have findmnt; then
-  echo "findmnt not found." >&2
-  exit 1
-fi
+for cmd in snapper btrfs findmnt awk sed sort; do
+  if ! have "$cmd"; then
+    echo "Missing required command: $cmd" >&2
+    exit 1
+  fi
+done
 
-extract_snapnum_from_path() {
-  # Accept paths like:
-  #   .snapshots/5/snapshot
-  #   /.snapshots/5/snapshot
-  #   @/.snapshots/5/snapshot
+# Extract N from paths like /.snapshots/N/snapshot
+snapnum_from_path() {
   local p="$1"
   if [[ "$p" =~ \.snapshots/([0-9]+)/snapshot ]]; then
     echo "${BASH_REMATCH[1]}"
@@ -73,126 +65,162 @@ extract_snapnum_from_path() {
   return 1
 }
 
-get_default_snapshot_num() {
-  # btrfs subvolume get-default /  -> includes "path ..."
-  local line path
-  line="$(btrfs subvolume get-default / 2>/dev/null || true)"
-  path="${line##* path }"
-  if [[ -z "$line" || "$path" == "$line" ]]; then
-    return 1
-  fi
-  extract_snapnum_from_path "$path"
-}
+# Current root subvol path (from mount options) and ID (from btrfs subvolume show)
+CURRENT_SUBVOL_PATH=""
+CURRENT_SNAPNUM=""
+CURRENT_SUBVOL_ID=""
 
-get_current_snapshot_num() {
-  # findmnt -no OPTIONS / -> contains subvol=...
-  local opts subvol
-  opts="$(findmnt -no OPTIONS / 2>/dev/null || true)"
-  subvol="$(tr ',' '\n' <<<"$opts" | sed -n 's/^subvol=//p' | head -n1)"
-  [[ -n "$subvol" ]] || return 1
-  extract_snapnum_from_path "$subvol"
-}
+opts="$(findmnt -no OPTIONS / || true)"
+subvol="$(tr ',' '\n' <<<"$opts" | sed -n 's/^subvol=//p' | head -n1 || true)"
+CURRENT_SUBVOL_PATH="${subvol:-}"
 
-DEFAULT_SNAP=""
-CURRENT_SNAP=""
+if [[ -n "$CURRENT_SUBVOL_PATH" ]]; then
+  CURRENT_SNAPNUM="$(snapnum_from_path "$CURRENT_SUBVOL_PATH" 2>/dev/null || true)"
+fi
 
-if DEFAULT_SNAP="$(get_default_snapshot_num 2>/dev/null)"; then
-  :
-else
-  echo "[ERR] Could not determine default snapshot number from btrfs default subvolume." >&2
-  echo "      btrfs subvolume get-default / output was:" >&2
-  btrfs subvolume get-default / >&2 || true
+# Get current root subvolume ID (works regardless of being snapshot/base)
+# btrfs subvolume show / output includes: "Subvolume ID: <id>"
+CURRENT_SUBVOL_ID="$(btrfs subvolume show / 2>/dev/null | awk -F': ' '/^Subvolume ID:/{print $2; exit}' || true)"
+if [[ -z "$CURRENT_SUBVOL_ID" ]]; then
+  echo "[ERR] Could not determine current root subvolume ID (btrfs subvolume show /)." >&2
   exit 1
 fi
 
-if CURRENT_SNAP="$(get_current_snapshot_num 2>/dev/null)"; then
-  :
-else
-  CURRENT_SNAP="" # might be "first root filesystem" (not a /.snapshots/N boot)
-fi
-
-# Build keep-set
-declare -A KEEP=()
-KEEP["1"]=1
-KEEP["$DEFAULT_SNAP"]=1
-if [[ -n "$CURRENT_SNAP" ]]; then
-  KEEP["$CURRENT_SNAP"]=1
-fi
-
-echo "[info] snapper config : $CFG"
-echo "[info] keep snapshots : $(printf "%s " "${!KEEP[@]}" | xargs echo)"
-echo "[info] default snap   : $DEFAULT_SNAP"
-echo "[info] current snap   : ${CURRENT_SNAP:-<not booted from /.snapshots/N>} "
+echo "[info] snapper config      : $CFG"
+echo "[info] current root subvol : ${CURRENT_SUBVOL_PATH:-<unknown>}"
+echo "[info] current snap number : ${CURRENT_SNAPNUM:-<not a /.snapshots/N boot>}"
+echo "[info] current subvol id   : $CURRENT_SUBVOL_ID"
 echo
 
-# Get all snapshot numbers
-# Prefer stable column output; fall back to parsing if needed.
-mapfile -t ALL < <(snapper -c "$CFG" list --no-headers --columns number 2>/dev/null | awk '{print $1}' || true)
-if [[ "${#ALL[@]}" -eq 0 ]]; then
-  # fallback parse: first column of normal output is the number
-  mapfile -t ALL < <(snapper -c "$CFG" list --no-headers 2>/dev/null | awk '{print $1}' || true)
+# In your desired workflow, CURRENT is what must remain.
+# So keep-set is ONLY current snapshot number (if it exists).
+declare -A KEEP=()
+if [[ -n "${CURRENT_SNAPNUM:-}" ]]; then
+  KEEP["$CURRENT_SNAPNUM"]=1
 fi
 
-# Filter deletions
-DEL=()
-for n in "${ALL[@]}"; do
+# Collect snapper snapshot numbers
+mapfile -t ALL_SNAPS < <(snapper -c "$CFG" list --no-headers --columns number 2>/dev/null | awk '{print $1}' || true)
+if [[ "${#ALL_SNAPS[@]}" -eq 0 ]]; then
+  mapfile -t ALL_SNAPS < <(snapper -c "$CFG" list --no-headers 2>/dev/null | awk '{print $1}' || true)
+fi
+
+DEL_SNAPS=()
+for n in "${ALL_SNAPS[@]}"; do
   [[ "$n" =~ ^[0-9]+$ ]] || continue
-  # skip special 0 if present
   [[ "$n" -eq 0 ]] && continue
   if [[ -z "${KEEP[$n]+x}" ]]; then
-    DEL+=("$n")
+    DEL_SNAPS+=("$n")
   fi
 done
 
-if [[ "${#DEL[@]}" -eq 0 ]]; then
-  echo "[info] Nothing to delete. Snapper snapshot set already minimal."
-  exit 0
-fi
-
-# Sort deletions
-IFS=$'\n' DEL=($(printf "%s\n" "${DEL[@]}" | sort -n))
-unset IFS
-
-# Build ranges for nicer deletion
-RANGES=()
-start="${DEL[0]}"
-prev="${DEL[0]}"
-
-for ((i=1; i<${#DEL[@]}; i++)); do
-  cur="${DEL[i]}"
-  if [[ "$cur" -eq $((prev + 1)) ]]; then
-    prev="$cur"
+# Also find orphaned snapshot subvols under /.snapshots that snapper may not list
+ORPHAN_SUBVOLS=()
+shopt -s nullglob
+for d in /.snapshots/[0-9]*/snapshot; do
+  n="$(awk -F'/' '{print $(NF-1)}' <<<"$d")"
+  [[ "$n" =~ ^[0-9]+$ ]] || continue
+  if [[ -n "${KEEP[$n]+x}" ]]; then
     continue
   fi
-  if [[ "$start" -eq "$prev" ]]; then
-    RANGES+=("$start")
-  else
-    RANGES+=("${start}-${prev}")
-  fi
-  start="$cur"
-  prev="$cur"
+  # If snapper lists it, it will be handled by snapper delete; if not, we treat as orphan too
+  ORPHAN_SUBVOLS+=("$n")
 done
-# finalize last
-if [[ "$start" -eq "$prev" ]]; then
-  RANGES+=("$start")
-else
-  RANGES+=("${start}-${prev}")
+shopt -u nullglob
+
+# De-dup orphan list
+if [[ "${#ORPHAN_SUBVOLS[@]}" -gt 0 ]]; then
+  mapfile -t ORPHAN_SUBVOLS < <(printf "%s\n" "${ORPHAN_SUBVOLS[@]}" | sort -n | awk '!seen[$0]++')
 fi
 
-echo "[plan] Will delete snapshots (ranges): ${RANGES[*]}"
+echo "[plan] snapper snapshots to delete : ${#DEL_SNAPS[@]}"
+if [[ "${#DEL_SNAPS[@]}" -gt 0 ]]; then
+  printf "  - %s\n" "${DEL_SNAPS[@]}" | head -n 50
+  [[ "${#DEL_SNAPS[@]}" -gt 50 ]] && echo "  ... (truncated)"
+fi
+echo
+
+echo "[plan] orphan snapshot subvols to delete (by number): ${#ORPHAN_SUBVOLS[@]}"
+if [[ "${#ORPHAN_SUBVOLS[@]}" -gt 0 ]]; then
+  printf "  - %s\n" "${ORPHAN_SUBVOLS[@]}" | head -n 50
+  [[ "${#ORPHAN_SUBVOLS[@]}" -gt 50 ]] && echo "  ... (truncated)"
+fi
+echo
+
+echo "[plan] set btrfs default to current subvol id: $CURRENT_SUBVOL_ID"
 echo
 
 if [[ "$APPLY" -eq 0 ]]; then
-  echo "[dry-run] Not applying. Re-run with --apply to delete."
+  echo "[dry-run] Not applying. Re-run with --apply."
   exit 0
 fi
 
-# Apply deletions
-for r in "${RANGES[@]}"; do
-  echo "[apply] snapper -c $CFG delete $r"
-  snapper -c "$CFG" delete "$r"
-done
+# 1) Make current state persist across reboot
+echo "[apply] btrfs subvolume set-default $CURRENT_SUBVOL_ID /"
+btrfs subvolume set-default "$CURRENT_SUBVOL_ID" /
+
+# 2) Delete snapper snapshots (except current)
+if [[ "${#DEL_SNAPS[@]}" -gt 0 ]]; then
+  # Delete in ascending order, individually (simple + reliable)
+  mapfile -t DEL_SNAPS < <(printf "%s\n" "${DEL_SNAPS[@]}" | sort -n)
+  for n in "${DEL_SNAPS[@]}"; do
+    echo "[apply] snapper -c $CFG delete $n"
+    snapper -c "$CFG" delete "$n" || true
+  done
+else
+  echo "[apply] no snapper snapshots to delete"
+fi
+
+# 3) Delete orphaned btrfs snapshot subvolumes not removed by snapper (if any)
+if [[ "${#ORPHAN_SUBVOLS[@]}" -gt 0 ]]; then
+  for n in "${ORPHAN_SUBVOLS[@]}"; do
+    p="/.snapshots/$n/snapshot"
+    if [[ -d "$p" ]]; then
+      # If mounted, try lazy unmount
+      if findmnt -rn "$p" >/dev/null 2>&1; then
+        echo "[apply] umount -l $p"
+        umount -l "$p" || true
+      fi
+      # Delete subvolume if it is one
+      if btrfs subvolume show "$p" >/dev/null 2>&1; then
+        echo "[apply] btrfs subvolume delete $p"
+        btrfs subvolume delete "$p" || true
+      fi
+      # Clean leftover metadata dirs (best-effort)
+      rm -rf "/.snapshots/$n" 2>/dev/null || true
+    fi
+  done
+else
+  echo "[apply] no orphan subvolumes to delete"
+fi
+
+# 4) Regenerate grub.cfg so stale menu entries disappear (best-effort)
+if have grub2-mkconfig; then
+  echo
+  echo "[apply] regenerating /boot/grub2/grub.cfg (best-effort)"
+  BOOT_REMOUNTED=0
+  if mountpoint -q /boot; then
+    if mount -o remount,rw /boot 2>/dev/null; then
+      BOOT_REMOUNTED=1
+    fi
+  fi
+
+  if grub2-mkconfig -o /boot/grub2/grub.cfg 2>/dev/null; then
+    echo "[apply] grub.cfg regenerated"
+  else
+    echo "[WARN] grub2-mkconfig failed (likely /boot is read-only on MicroOS)." >&2
+    echo "       Workaround:" >&2
+    echo "         sudo transactional-update -n run grub2-mkconfig -o /boot/grub2/grub.cfg" >&2
+    echo "       Then run this script again (because TU creates a new snapshot)." >&2
+  fi
+
+  if [[ "$BOOT_REMOUNTED" -eq 1 ]]; then
+    mount -o remount,ro /boot 2>/dev/null || true
+  fi
+else
+  echo "[WARN] grub2-mkconfig not found; GRUB menu might remain stale until regenerated." >&2
+fi
 
 echo
-echo "[ok] Deletion completed."
-echo "[note] Reboot to see GRUB snapshot menu shrink to the remaining default snapshot."
+echo "[ok] Done."
+echo "[next] Reboot now. GRUB should show only the current state (single Snapshot Update entry)."
