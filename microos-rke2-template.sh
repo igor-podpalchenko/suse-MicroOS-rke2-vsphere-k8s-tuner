@@ -40,6 +40,12 @@ tu() {
 }
 
 # -------------------------
+# Path helpers
+# -------------------------
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# -------------------------
 # GRUB patching (MicroOS-safe)
 # -------------------------
 
@@ -136,12 +142,22 @@ fi
 # We act once the Rancher system-agent is INSTALLED (unit file exists).
 # (It might not be active yet when first installed.)
 UNIT="rancher-system-agent.service"
+PURGE_SCRIPT="/usr/local/sbin/purge-packages-after-rke2-provisioned.sh"
 if ! systemctl list-unit-files --no-legend "${UNIT}" >/dev/null 2>&1; then
   # Not installed yet; try again on next timer tick.
   exit 0
 fi
 
-log "Detected installed ${UNIT}; disabling cloud-init and removing boot wiring"
+log "Detected installed ${UNIT}; running post-provision cleanup then disabling cloud-init"
+
+if [[ -x "${PURGE_SCRIPT}" ]]; then
+  log "Invoking ${PURGE_SCRIPT} --apply (best-effort)"
+  if ! "${PURGE_SCRIPT}" --apply; then
+    log "[WARN] ${PURGE_SCRIPT} failed (continuing to disable cloud-init)"
+  fi
+else
+  log "[WARN] Purge script not found/executable at ${PURGE_SCRIPT}; skipping package cleanup"
+fi
 
 # Standard kill switch
 mkdir -p /etc/cloud
@@ -198,6 +214,23 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now cloud-init-disable-if-rancher-agent.timer
+}
+
+# -------------------------
+# Post-provision purge script install
+# -------------------------
+
+install_post_rancher_purge_script() {
+  local src="${SCRIPT_DIR}/purge-packages-after-rke2-provisioned.sh"
+  local dst="/usr/local/sbin/purge-packages-after-rke2-provisioned.sh"
+
+  if [[ ! -f "$src" ]]; then
+    log "Missing purge script at ${src}; required for post-provision cleanup."
+    exit 1
+  fi
+
+  install -m 0755 "$src" "$dst"
+  log "Installed purge-packages-after-rke2-provisioned.sh to ${dst}"
 }
 
 # -------------------------
@@ -298,6 +331,9 @@ EOF
 
   # Patch GRUB (timeout + fd0 suppression) and regenerate config in a MicroOS-safe way
   patch_grub
+
+  # Install the purge script used post-Rancher provisioning (timer hook)
+  install_post_rancher_purge_script
 
   # Install timer to disable cloud-init once rancher-system-agent is installed
   install_cloudinit_autodisable_timer
