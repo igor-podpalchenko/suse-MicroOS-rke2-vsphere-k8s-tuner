@@ -28,7 +28,7 @@ if [[ "${EUID}" -ne 0 ]]; then
 fi
 
 have() { command -v "$1" >/dev/null 2>&1; }
-for cmd in btrfs findmnt awk sed sort mount umount ls rm; do
+for cmd in btrfs findmnt awk sed sort mount umount ls rm date; do
   have "$cmd" || { echo "Missing required command: $cmd" >&2; exit 1; }
 done
 
@@ -188,10 +188,45 @@ mapfile -t ALL_NUMS < <(
   ls -1 "/.snapshots" 2>/dev/null | awk '/^[0-9]+$/ {print $1}' | sort -n
 )
 
+declare -A KEEP_SET
+KEEP_SET["$KEEP_NUM"]=1
+
+EARLIEST_BY_NUM=""
+for n in "${ALL_NUMS[@]}"; do
+  [[ "$n" == "0" || "$n" == "$KEEP_NUM" ]] && continue
+  EARLIEST_BY_NUM="$n"
+  break
+done
+
+EARLIEST_BY_DATE=""
+EARLIEST_DATE_TS=""
+for n in "${ALL_NUMS[@]}"; do
+  [[ "$n" == "0" || "$n" == "$KEEP_NUM" ]] && continue
+  info_path="$SNAP_DIR/$n/info.xml"
+  if [[ -f "$info_path" ]]; then
+    snap_date="$(sed -n 's:.*<date>\\(.*\\)</date>.*:\\1:p' "$info_path" | head -n1 || true)"
+    if [[ -n "$snap_date" ]]; then
+      if ts="$(date -d "$snap_date" +%s 2>/dev/null)"; then
+        if [[ -z "$EARLIEST_DATE_TS" || "$ts" -lt "$EARLIEST_DATE_TS" ]]; then
+          EARLIEST_DATE_TS="$ts"
+          EARLIEST_BY_DATE="$n"
+        fi
+      fi
+    fi
+  fi
+done
+
+[[ -n "$EARLIEST_BY_NUM" ]] && KEEP_SET["$EARLIEST_BY_NUM"]=1
+[[ -n "$EARLIEST_BY_DATE" ]] && KEEP_SET["$EARLIEST_BY_DATE"]=1
+
+echo "[info] keeping snapshot (current boot): $KEEP_NUM"
+[[ -n "$EARLIEST_BY_NUM" ]] && echo "[info] keeping earliest snapshot by number: $EARLIEST_BY_NUM"
+[[ -n "$EARLIEST_BY_DATE" ]] && echo "[info] keeping earliest snapshot by taken date: $EARLIEST_BY_DATE"
+
 DEL_NUMS=()
 for n in "${ALL_NUMS[@]}"; do
   [[ "$n" == "0" ]] && continue
-  [[ "$n" == "$KEEP_NUM" ]] && continue
+  [[ -n "${KEEP_SET[$n]:-}" ]] && continue
   DEL_NUMS+=("$n")
 done
 
