@@ -24,24 +24,23 @@ This is the expected flow for building a minimal vSphere template. All steps run
 
 3. **Kernel driver pruning for vSphere**
    ```bash
-   du -hs /lib/modules/6.18.2-1-default/kernel
+   du -hs /lib/modules/6.18.2-1-default
    ./purge-ko-for-vsphere.sh --apply
    reboot
-
-   du -hs /lib/modules/6.18.2-1-default/kernel
    ```
 
 4. **Stage 1: install base components**
    ```bash
-   sudo ./microos-rke2-template.sh --stage1
+   du -hs /lib/modules/6.18.2-1-default
+   ./microos-rke2-template.sh --stage1
    reboot
    ```
 
 5. **Post configuration**
    ```bash
-   sudo ./microos-rke2-template.sh --post
+   ./microos-rke2-template.sh --post
    # enables services, patches GRUB, wires cloud-init for Rancher, and installs the auto-disable timer
-   sudo ./microos-rke2-template.sh --finalize
+   ./microos-rke2-template.sh --finalize
    # resets cloud-init state and shuts down; before shutdown you can run optional cleanup:
    ./merge-snapshoots.sh --apply
    ```
