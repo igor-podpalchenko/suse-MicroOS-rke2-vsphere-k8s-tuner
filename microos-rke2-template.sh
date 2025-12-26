@@ -47,20 +47,20 @@ patch_grub_defaults() {
   local grub_def="/etc/default/grub"
   [[ -f "$grub_def" ]] || { log "GRUB defaults not found ($grub_def); skipping GRUB patch"; return 0; }
 
-  log "Patching /etc/default/grub: GRUB_TIMEOUT=5, GRUB_RECORDFAIL_TIMEOUT=5, add modprobe.blacklist=floppy"
+  log "Patching /etc/default/grub: GRUB_TIMEOUT=3, GRUB_RECORDFAIL_TIMEOUT=3, add modprobe.blacklist=floppy"
 
   # Visible menu timeout
   if grep -q '^GRUB_TIMEOUT=' "$grub_def"; then
-    sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=5/' "$grub_def"
+    sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=3/' "$grub_def"
   else
-    echo 'GRUB_TIMEOUT=5' >> "$grub_def"
+    echo 'GRUB_TIMEOUT=3' >> "$grub_def"
   fi
 
   # Recordfail timeout can override what you see on screen
   if grep -q '^GRUB_RECORDFAIL_TIMEOUT=' "$grub_def"; then
-    sed -i 's/^GRUB_RECORDFAIL_TIMEOUT=.*/GRUB_RECORDFAIL_TIMEOUT=5/' "$grub_def"
+    sed -i 's/^GRUB_RECORDFAIL_TIMEOUT=.*/GRUB_RECORDFAIL_TIMEOUT=3/' "$grub_def"
   else
-    echo 'GRUB_RECORDFAIL_TIMEOUT=5' >> "$grub_def"
+    echo 'GRUB_RECORDFAIL_TIMEOUT=3' >> "$grub_def"
   fi
 
   # Floppy suppression via kernel cmdline (bootloader-level; takes effect next boot)
