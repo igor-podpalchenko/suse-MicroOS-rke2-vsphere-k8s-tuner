@@ -329,6 +329,14 @@ EOF
   done
   systemctl daemon-reload
 
+  # Persist /etc/rancher on /var/persist
+  mkdir -p /var/persist/etc/rancher
+  if [[ -d /etc/rancher && ! -L /etc/rancher ]]; then
+    cp -a /etc/rancher/. /var/persist/etc/rancher/ 2>/dev/null || true
+    rm -rf /etc/rancher
+  fi
+  ln -sfn /var/persist/etc/rancher /etc/rancher
+
   # Patch GRUB (timeout + fd0 suppression) and regenerate config in a MicroOS-safe way
   patch_grub
 
