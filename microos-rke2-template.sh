@@ -39,6 +39,75 @@ tu() {
   fi
 }
 
+SNAPPER_CMD=(snapper)
+
+snapper_capture_state() {
+  local out_var="$1"
+  local -n out_ref="$out_var"
+  out_ref=()
+
+  local snapper_bin="${SNAPPER_CMD[${#SNAPPER_CMD[@]}-1]}"
+  if ! command -v "${snapper_bin}" >/dev/null 2>&1; then
+    echo "[warn] snapper not found; snapshot descriptions will not be updated" >&2
+    return 1
+  fi
+
+  mapfile -t out_ref < <("${SNAPPER_CMD[@]}" --csvout list 2>/dev/null | awk 'NR>1')
+  return 0
+}
+
+annotate_snapper_diff() {
+  local desc="$1"
+  local before_var="$2"
+  local -n before_ref="$before_var"
+
+  local snapper_bin="${SNAPPER_CMD[${#SNAPPER_CMD[@]}-1]}"
+  if ! command -v "${snapper_bin}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local -A before_set before_dates
+  for line in "${before_ref[@]}"; do
+    IFS=';' read -r id type pre date user cleanup desc_before userdata_before <<<"$line"
+    [[ -z "$id" ]] && continue
+    before_set["$id"]=1
+    before_dates["$id"]="$date"
+  done
+
+  local -a after_lines=()
+  mapfile -t after_lines < <("${SNAPPER_CMD[@]}" --csvout list 2>/dev/null | awk 'NR>1')
+  local -A after_pre after_date after_userdata
+  for line in "${after_lines[@]}"; do
+    IFS=';' read -r id type pre date user cleanup desc_after userdata_after <<<"$line"
+    [[ -z "$id" ]] && continue
+    after_pre["$id"]="$pre"
+    after_date["$id"]="$date"
+    after_userdata["$id"]="$userdata_after"
+  done
+
+  for id in "${!after_pre[@]}"; do
+    [[ -n "${before_set[$id]:-}" ]] && continue
+    local parent="${after_pre[$id]}"
+    local parent_date="${after_date[$parent]:-}"
+
+    local -a userdata_fields=()
+    if [[ -n "${after_userdata[$id]}" ]]; then
+      userdata_fields+=("${after_userdata[$id]}")
+    fi
+    if [[ -n "$parent" && "$parent" != "-" && "$parent" != "0" ]]; then
+      userdata_fields+=("parent_id=${parent}")
+      if [[ -n "$parent_date" ]]; then
+        userdata_fields+=("parent_date=${parent_date// /T}")
+      fi
+    fi
+    local combined_userdata
+    combined_userdata="$(printf '%s ' "${userdata_fields[@]}" | sed 's/[[:space:]]*$//')"
+
+    log "snapper modify --description \"${desc}\" --userdata \"${combined_userdata}\" ${id}"
+    "${SNAPPER_CMD[@]}" modify --description "$desc" --userdata "$combined_userdata" "$id" || true
+  done
+}
+
 ensure_grub_cmdline_args() {
   local grub_def="/etc/default/grub"
   local args=("$@")
@@ -123,6 +192,12 @@ regen_grub_cfg_transactional() {
   # The supported, robust way is: transactional-update grub.cfg
   log "Regenerating GRUB config via transactional-update (MicroOS-safe)"
 
+  local SNAP_BEFORE=()
+  local SNAPPER_TRACKING=0
+  if snapper_capture_state SNAP_BEFORE; then
+    SNAPPER_TRACKING=1
+  fi
+
   # Prefer the dedicated helper if available (it is on MicroOS / Leap Micro / SLE Micro).
   # This runs grub2-mkconfig in the proper context and updates /boot/grub2/grub.cfg.
   if transactional-update --help 2>/dev/null | grep -q 'grub\.cfg'; then
@@ -141,6 +216,10 @@ regen_grub_cfg_transactional() {
         grub2-mkconfig -o /boot/efi/EFI/BOOT/grub.cfg 2>/dev/null || true
       fi
     '
+  fi
+
+  if (( SNAPPER_TRACKING == 1 )); then
+    annotate_snapper_diff "microos-rke2-template grub.cfg regeneration" SNAP_BEFORE
   fi
 
   log "GRUB config regeneration done."
@@ -275,6 +354,12 @@ install_post_rancher_purge_script() {
 stage1_install_packages() {
   log "Stage1: transactional package install (will reboot afterwards)"
 
+  local SNAP_BEFORE=()
+  local SNAPPER_TRACKING=0
+  if snapper_capture_state SNAP_BEFORE; then
+    SNAPPER_TRACKING=1
+  fi
+
   tu -n pkg install \
     cloud-init \
     open-vm-tools \
@@ -286,6 +371,10 @@ stage1_install_packages() {
     apparmor-parser \
     net-tools-deprecated \
     xorriso
+
+  if (( SNAPPER_TRACKING == 1 )); then
+    annotate_snapper_diff "microos-rke2-template stage1 package install" SNAP_BEFORE
+  fi
 
   log "Stage1 done. Rebooting to activate snapshot."
   log "Call reboot when ready."

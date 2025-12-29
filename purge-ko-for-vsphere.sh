@@ -83,10 +83,80 @@ if (( APPLY == 0 )); then
   exit 0
 fi
 
+snapper_capture_state() {
+  local out_var="$1"
+  local -n out_ref="$out_var"
+
+  out_ref=()
+  if ! command -v snapper >/dev/null 2>&1; then
+    echo "[warn] snapper not found; snapshot descriptions will not be updated" >&2
+    return 1
+  fi
+
+  mapfile -t out_ref < <(snapper --csvout list 2>/dev/null | awk 'NR>1')
+  return 0
+}
+
+annotate_snapper_diff() {
+  local desc="$1"
+  local before_var="$2"
+  local -n before_ref="$before_var"
+
+  if ! command -v snapper >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local -A before_set before_dates
+  for line in "${before_ref[@]}"; do
+    IFS=';' read -r id type pre date user cleanup desc_before userdata_before <<<"$line"
+    [[ -z "$id" ]] && continue
+    before_set["$id"]=1
+    before_dates["$id"]="$date"
+  done
+
+  local -a after_lines=()
+  mapfile -t after_lines < <(snapper --csvout list 2>/dev/null | awk 'NR>1')
+  local -A after_pre after_date after_userdata
+  for line in "${after_lines[@]}"; do
+    IFS=';' read -r id type pre date user cleanup desc_after userdata_after <<<"$line"
+    [[ -z "$id" ]] && continue
+    after_pre["$id"]="$pre"
+    after_date["$id"]="$date"
+    after_userdata["$id"]="$userdata_after"
+  done
+
+  for id in "${!after_pre[@]}"; do
+    [[ -n "${before_set[$id]:-}" ]] && continue
+    local parent="${after_pre[$id]}"
+    local parent_date="${after_date[$parent]:-}"
+
+    local -a userdata_fields=()
+    if [[ -n "${after_userdata[$id]}" ]]; then
+      userdata_fields+=("${after_userdata[$id]}")
+    fi
+    if [[ -n "$parent" && "$parent" != "-" && "$parent" != "0" ]]; then
+      userdata_fields+=("parent_id=${parent}")
+      if [[ -n "$parent_date" ]]; then
+        userdata_fields+=("parent_date=${parent_date// /T}")
+      fi
+    fi
+    local combined_userdata
+    combined_userdata="$(printf '%s ' "${userdata_fields[@]}" | sed 's/[[:space:]]*$//')"
+
+    echo "[apply] snapper modify --description \"${desc}\" --userdata \"${combined_userdata}\" ${id}"
+    snapper modify --description "$desc" --userdata "$combined_userdata" "$id" || true
+  done
+}
+
 LOG="/var/tmp/kpurge.${KVER}.apply.log"
 echo
 echo "[apply] Starting transactional-update; all discovery+delete happens INSIDE snapshot."
 echo "[apply] Log: ${LOG}"
+SNAP_BEFORE=()
+SNAPPER_TRACKING=0
+if snapper_capture_state SNAP_BEFORE; then
+  SNAPPER_TRACKING=1
+fi
 echo "[apply] Running transactional-update now..."
 
 # IMPORTANT: Inline TU payload. Do NOT rely on /var/tmp script existing in snapshot.
@@ -351,6 +421,10 @@ echo "[tu] Freed-bytes (drivers subtree): $(bytes_human "$freed")"
 echo "[tu] DONE"
 EOS
 )" 2>&1 | tee "$LOG"
+
+if (( SNAPPER_TRACKING == 1 )); then
+  annotate_snapper_diff "purge-ko-for-vsphere --apply" SNAP_BEFORE
+fi
 
 echo
 echo "[apply] transactional-update finished. Reboot to activate:"
