@@ -28,7 +28,7 @@ if [[ "${EUID}" -ne 0 ]]; then
 fi
 
 have() { command -v "$1" >/dev/null 2>&1; }
-for cmd in btrfs findmnt awk sed sort mount umount ls rm date; do
+for cmd in btrfs findmnt awk sed sort mount umount ls date snapper; do
   have "$cmd" || { echo "Missing required command: $cmd" >&2; exit 1; }
 done
 
@@ -39,74 +39,6 @@ snapnum_from_path() {
     return 0
   fi
   return 1
-}
-
-set_ro_false() {
-  local path="$1"
-  btrfs property set -ts "$path" ro false >/dev/null 2>&1 || true
-  btrfs property set -t s  "$path" ro false >/dev/null 2>&1 || true
-  btrfs property set       "$path" ro false >/dev/null 2>&1 || true
-}
-
-list_child_subvol_relpaths() {
-  local parent_abs="$1"
-  # Children of a given subvolume (direct only). Paths are relative to the filesystem root (our ADMIN_MNT).
-  btrfs subvolume list -o "$parent_abs" 2>/dev/null | awk '
-    {
-      pos=index($0," path ");
-      if (pos>0) print substr($0,pos+6);
-    }'
-}
-
-# TRUE recursive deletion:
-#  - delete children first (and their children, etc.)
-#  - then delete the parent
-delete_subvol_recursive() {
-  local abs="$1"
-
-  # Find direct children and recurse into them first (deepest-first)
-  mapfile -t children_rel < <(list_child_subvol_relpaths "$abs" | awk 'NF')
-  if [[ "${#children_rel[@]}" -gt 0 ]]; then
-    # Sort by path length descending so deeper paths go first
-    mapfile -t children_rel < <(
-      printf "%s\n" "${children_rel[@]}" |
-        awk '{print length($0) "\t" $0}' |
-        sort -nr |
-        cut -f2-
-    )
-
-    for rel in "${children_rel[@]}"; do
-      local child_abs="$ADMIN_MNT/$rel"
-      if btrfs subvolume show "$child_abs" >/dev/null 2>&1; then
-        delete_subvol_recursive "$child_abs"
-      fi
-    done
-  fi
-
-  # Now delete this subvolume itself
-  if findmnt -rn "$abs" >/dev/null 2>&1; then
-    echo "[apply] umount -l $abs"
-    umount -l "$abs" || true
-  fi
-
-  if btrfs subvolume show "$abs" >/dev/null 2>&1; then
-    set_ro_false "$abs"
-    echo "[apply] btrfs subvolume delete $abs"
-    if ! btrfs subvolume delete "$abs"; then
-      # If something raced/appeared, try one more time after re-listing children
-      # (still best-effort; but usually this second pass resolves it)
-      echo "[warn] delete failed, retrying after another child scan: $abs" >&2
-      mapfile -t retry_children < <(list_child_subvol_relpaths "$abs" | awk 'NF')
-      for rel in "${retry_children[@]}"; do
-        local child_abs="$ADMIN_MNT/$rel"
-        if btrfs subvolume show "$child_abs" >/dev/null 2>&1; then
-          delete_subvol_recursive "$child_abs"
-        fi
-      done
-      set_ro_false "$abs"
-      btrfs subvolume delete "$abs" || true
-    fi
-  fi
 }
 
 ensure_admin_mount() {
@@ -246,22 +178,18 @@ ensure_admin_mount
 echo "[apply] btrfs subvolume set-default $CURRENT_SUBVOLID $ADMIN_MNT"
 btrfs subvolume set-default "$CURRENT_SUBVOLID" "$ADMIN_MNT"
 
-# Delete snapshot subvolumes + remove their metadata directories
-for n in "${DEL_NUMS[@]}"; do
-  snap_abs="$ADMIN_MNT$ROOT_PREFIX/.snapshots/$n/snapshot"
-
-  if [[ -d "$snap_abs" ]] && btrfs subvolume show "$snap_abs" >/dev/null 2>&1; then
-    delete_subvol_recursive "$snap_abs"
+if [[ "${#DEL_NUMS[@]}" -eq 0 ]]; then
+  echo "[apply] No snapshots selected for deletion."
+else
+  echo "[apply] snapper delete ${DEL_NUMS[*]}"
+  if ! snapper delete "${DEL_NUMS[@]}"; then
+    echo "[warn] snapper delete returned non-zero; inspect output above." >&2
   fi
+fi
 
-  # Remove the remaining metadata dir (files), even if snapshot subvol already gone
-  meta_abs="$ADMIN_MNT$ROOT_PREFIX/.snapshots/$n"
-  if [[ -d "$meta_abs" ]]; then
-    echo "[apply] rm -rf $meta_abs"
-    rm -rf "$meta_abs" || true
-  fi
-done
-
+echo
+echo "[verify] snapper list (post-delete):"
+snapper list || true
 echo
 echo "[verify] remaining entries under $ADMIN_MNT$ROOT_PREFIX/.snapshots:"
 ls -la "$ADMIN_MNT$ROOT_PREFIX/.snapshots" || true
