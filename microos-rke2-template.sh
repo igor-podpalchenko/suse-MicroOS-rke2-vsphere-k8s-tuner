@@ -410,6 +410,7 @@ finalize_for_template() {
 
   truncate -s 0 /etc/machine-id
   rm -f /var/lib/dbus/machine-id
+  rm -f /var/lib/systemd/random-seed
   ln -sf /etc/machine-id /var/lib/dbus/machine-id
 
   sync
