@@ -97,6 +97,34 @@ snapper_capture_state() {
   return 0
 }
 
+parse_snapper_csv_line() {
+  # snapper --csvout list is comma-separated. Extract the fields we care about
+  # (number, pre-number, date, userdata) while tolerating missing values.
+  local line="$1"
+  local number_var="$2" pre_var="$3" date_var="$4" userdata_var="$5"
+  local -n number_ref="$number_var"
+  local -n pre_ref="$pre_var"
+  local -n date_ref="$date_var"
+  local -n userdata_ref="$userdata_var"
+
+  number_ref=""
+  pre_ref=""
+  date_ref=""
+  userdata_ref=""
+
+  # snapper --csvout currently uses ';' as separator, but fall back to ',' if seen.
+  local delim=';'
+  if [[ "$line" != *";"* && "$line" == *,* ]]; then
+    delim=','
+  fi
+
+  IFS="$delim" read -r _config _subvol _number _default _active _type _pre _date _user _used _cleanup _desc _userdata <<<"$line"
+  number_ref="${_number//[[:space:]]/}"
+  pre_ref="${_pre//[[:space:]]/}"
+  date_ref="${_date:-}"
+  userdata_ref="${_userdata:-}"
+}
+
 annotate_snapper_diff() {
   local desc="$1"
   local before_var="$2"
@@ -108,7 +136,8 @@ annotate_snapper_diff() {
 
   local -A before_set before_dates
   for line in "${before_ref[@]}"; do
-    IFS=';' read -r id type pre date user cleanup desc_before userdata_before <<<"$line"
+    local id pre date userdata
+    parse_snapper_csv_line "$line" id pre date userdata
     [[ -z "$id" ]] && continue
     before_set["$id"]=1
     before_dates["$id"]="$date"
@@ -118,11 +147,12 @@ annotate_snapper_diff() {
   mapfile -t after_lines < <(snapper --csvout list 2>/dev/null | awk 'NR>1')
   local -A after_pre after_date after_userdata
   for line in "${after_lines[@]}"; do
-    IFS=';' read -r id type pre date user cleanup desc_after userdata_after <<<"$line"
+    local id pre date userdata
+    parse_snapper_csv_line "$line" id pre date userdata
     [[ -z "$id" ]] && continue
     after_pre["$id"]="$pre"
     after_date["$id"]="$date"
-    after_userdata["$id"]="$userdata_after"
+    after_userdata["$id"]="$userdata"
   done
 
   for id in "${!after_pre[@]}"; do
