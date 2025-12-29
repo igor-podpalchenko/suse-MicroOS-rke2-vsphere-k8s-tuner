@@ -101,11 +101,16 @@ parse_snapper_csv_line() {
   # snapper --csvout list is comma-separated. Extract the fields we care about
   # (number, pre-number, date, userdata) while tolerating missing values.
   local line="$1"
-  local number_var="$2" pre_var="$3" date_var="$4" userdata_var="$5"
+  local number_var="$2" pre_var="$3" date_var="$4" userdata_var="$5" active_var="${6:-}"
   local -n number_ref="$number_var"
   local -n pre_ref="$pre_var"
   local -n date_ref="$date_var"
   local -n userdata_ref="$userdata_var"
+
+  if [[ -n "$active_var" ]]; then
+    local -n active_ref="$active_var"
+    active_ref=""
+  fi
 
   number_ref=""
   pre_ref=""
@@ -123,6 +128,9 @@ parse_snapper_csv_line() {
   pre_ref="${_pre//[[:space:]]/}"
   date_ref="${_date:-}"
   userdata_ref="${_userdata:-}"
+  if [[ -n "$active_var" ]]; then
+    active_ref="${_active:-}"
+  fi
 }
 
 annotate_snapper_diff() {
@@ -135,13 +143,28 @@ annotate_snapper_diff() {
   fi
 
   local -A before_set before_dates
+  local -a before_numbers=()
+  local parent_snapshot_id=""
   for line in "${before_ref[@]}"; do
-    local id pre date userdata
-    parse_snapper_csv_line "$line" id pre date userdata
+    local id pre date userdata active
+    parse_snapper_csv_line "$line" id pre date userdata active
     [[ -z "$id" ]] && continue
     before_set["$id"]=1
     before_dates["$id"]="$date"
+    before_numbers+=("$id")
+
+    if [[ -z "$parent_snapshot_id" ]]; then
+      case "${active,,}" in
+        yes|true|current|\*|+)
+          parent_snapshot_id="$id"
+          ;;
+      esac
+    fi
   done
+
+  if [[ -z "$parent_snapshot_id" && ${#before_numbers[@]} -gt 0 ]]; then
+    parent_snapshot_id="$(printf '%s\n' "${before_numbers[@]}" | sort -nr | head -n1)"
+  fi
 
   local -a after_lines=()
   mapfile -t after_lines < <(snapper --csvout list 2>/dev/null | awk 'NR>1')
@@ -167,6 +190,9 @@ annotate_snapper_diff() {
     if [[ -n "${after_userdata[$id]}" ]]; then
       userdata_fields+=("${after_userdata[$id]}")
     fi
+    if [[ -n "$parent_snapshot_id" ]]; then
+      userdata_fields+=("parent=${parent_snapshot_id}")
+    fi
     if [[ -n "$parent" && "$parent" != "-" && "$parent" != "0" ]]; then
       userdata_fields+=("parent_id=${parent}")
       if [[ -n "$parent_date" ]]; then
@@ -176,8 +202,13 @@ annotate_snapper_diff() {
     local combined_userdata
     combined_userdata="$(printf '%s ' "${userdata_fields[@]}" | sed 's/[[:space:]]*$//')"
 
-    echo "[apply] snapper modify --description \"${desc}\" --userdata \"${combined_userdata}\" ${id}"
-    snapper modify --description "$desc" --userdata "$combined_userdata" "$id" || true
+    if [[ -n "$combined_userdata" ]]; then
+      echo "[apply] snapper modify --description \"${desc}\" --userdata \"${combined_userdata}\" ${id}"
+      snapper modify --description "$desc" --userdata "$combined_userdata" "$id" || true
+    else
+      echo "[apply] snapper modify --description \"${desc}\" ${id}"
+      snapper modify --description "$desc" "$id" || true
+    fi
   done
 }
 
