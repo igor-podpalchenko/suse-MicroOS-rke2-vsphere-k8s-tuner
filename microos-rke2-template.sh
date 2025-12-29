@@ -39,6 +39,49 @@ tu() {
   fi
 }
 
+ensure_grub_cmdline_args() {
+  local grub_def="/etc/default/grub"
+  local args=("$@")
+  local target_var=""
+
+  for var in GRUB_CMDLINE_LINUX_DEFAULT GRUB_CMDLINE_LINUX; do
+    if grep -q "^${var}=" "$grub_def"; then
+      target_var="$var"
+      break
+    fi
+  done
+
+  if [[ -z "$target_var" ]]; then
+    target_var="GRUB_CMDLINE_LINUX_DEFAULT"
+    echo "${target_var}=\"${args[*]}\"" >> "$grub_def"
+    return
+  fi
+
+  local current
+  current=$(grep -E "^${target_var}=" "$grub_def" | head -n1 | sed -E "s/^${target_var}=\"(.*)\"/\\1/")
+
+  for arg in "${args[@]}"; do
+    if [[ " ${current} " != *" ${arg} "* ]]; then
+      current="${current} ${arg}"
+    fi
+  done
+
+  current="$(echo "${current}" | xargs)"
+
+  local tmp
+  tmp="$(mktemp)"
+  while IFS= read -r line; do
+    if [[ "$line" == ${target_var}=* ]]; then
+      echo "${target_var}=\"${current}\"" >> "$tmp"
+    else
+      echo "$line" >> "$tmp"
+    fi
+  done < "$grub_def"
+
+  cat "$tmp" > "$grub_def"
+  rm -f "$tmp"
+}
+
 # -------------------------
 # Path helpers
 # -------------------------
@@ -53,7 +96,7 @@ patch_grub_defaults() {
   local grub_def="/etc/default/grub"
   [[ -f "$grub_def" ]] || { log "GRUB defaults not found ($grub_def); skipping GRUB patch"; return 0; }
 
-  log "Patching /etc/default/grub: GRUB_TIMEOUT=3, GRUB_RECORDFAIL_TIMEOUT=3, add modprobe.blacklist=floppy"
+  log "Patching /etc/default/grub: GRUB_TIMEOUT=3, GRUB_RECORDFAIL_TIMEOUT=3, add modprobe.blacklist=floppy, SELinux permissive kernel args"
 
   # Visible menu timeout
   if grep -q '^GRUB_TIMEOUT=' "$grub_def"; then
@@ -69,18 +112,10 @@ patch_grub_defaults() {
     echo 'GRUB_RECORDFAIL_TIMEOUT=3' >> "$grub_def"
   fi
 
-  # Floppy suppression via kernel cmdline (bootloader-level; takes effect next boot)
-  if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' "$grub_def"; then
-    if ! grep -q 'modprobe\.blacklist=floppy' "$grub_def"; then
-      sed -i 's/^\(GRUB_CMDLINE_LINUX_DEFAULT="[^"]*\)"/\1 modprobe.blacklist=floppy"/' "$grub_def"
-    fi
-  elif grep -q '^GRUB_CMDLINE_LINUX=' "$grub_def"; then
-    if ! grep -q 'modprobe\.blacklist=floppy' "$grub_def"; then
-      sed -i 's/^\(GRUB_CMDLINE_LINUX="[^"]*\)"/\1 modprobe.blacklist=floppy"/' "$grub_def"
-    fi
-  else
-    echo 'GRUB_CMDLINE_LINUX_DEFAULT="modprobe.blacklist=floppy"' >> "$grub_def"
-  fi
+  # Kernel args (merged into existing GRUB_CMDLINE_* if present)
+  ensure_grub_cmdline_args \
+    modprobe.blacklist=floppy \
+    security=selinux selinux=1 enforcing=0
 }
 
 regen_grub_cfg_transactional() {
