@@ -128,7 +128,10 @@ annotate_snapper_diff() {
   for id in "${!after_pre[@]}"; do
     [[ -n "${before_set[$id]:-}" ]] && continue
     local parent="${after_pre[$id]}"
-    local parent_date="${after_date[$parent]:-}"
+    local parent_date=""
+    if [[ -n "$parent" && "$parent" != "-" && "$parent" != "0" ]]; then
+      parent_date="${after_date[$parent]:-}"
+    fi
 
     local -a userdata_fields=()
     if [[ -n "${after_userdata[$id]}" ]]; then
