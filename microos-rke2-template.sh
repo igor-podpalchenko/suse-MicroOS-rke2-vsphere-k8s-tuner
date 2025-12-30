@@ -458,6 +458,12 @@ post_config() {
   systemctl enable --now vgauthd || true
   systemctl enable --now iscsid || systemctl enable --now iscsid.service || true
 
+  # Disable serial console login on ttyS0
+  log "Disabling serial-getty on ttyS0"
+  systemctl disable serial-getty@ttyS0.service || true
+  systemctl mask serial-getty@ttyS0.service || true
+  systemctl stop serial-getty@ttyS0.service || true
+
   # Disable Combustion + ignition units if present
   systemctl disable --now combustion 2>/dev/null || true
   systemctl mask combustion 2>/dev/null || true
