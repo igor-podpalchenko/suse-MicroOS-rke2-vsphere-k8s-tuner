@@ -481,11 +481,19 @@ EOF
 
   # crictl config (optional but handy)
   cat > /etc/crictl.yaml <<'EOF'
-runtime-endpoint: unix:///run/rke2/containerd/containerd.sock
-image-endpoint: unix:///run/rke2/containerd/containerd.sock
+runtime-endpoint: unix:///run/k3s/containerd/containerd.sock
+image-endpoint: unix:///run/k3s/containerd/containerd.sock
 timeout: 10
 debug: false
 EOF
+
+  # System-wide environment for crictl/containerd access
+  cat > /etc/profile.d/rke2-containerd.sh <<'EOF'
+export CRI_CONFIG_FILE=/etc/crictl.yaml
+export CONTAINERD_ADDRESS=unix:///run/k3s/containerd/containerd.sock
+export PATH="$PATH:/var/lib/rancher/rke2/bin"
+EOF
+  chmod 0644 /etc/profile.d/rke2-containerd.sh
 
   # Cloud-init: force enable + prefer NoCloud
   rm -f /etc/cloud/cloud-init.disabled
